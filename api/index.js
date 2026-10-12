@@ -69,6 +69,38 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
+const CTX_TIMEOUT_MS = 500;
+
+function ctxConfig(sessionId) {
+  const base = String(process.env.ALICE_CTX_URL || "").replace(/\/+$/, "");
+  const token = process.env.ALICE_CTX_TOKEN;
+  const key = String(sessionId || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 128);
+  if (!base || !token || !key) return null;
+  return { url: `${base}/h/${key}`, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } };
+}
+
+async function loadHistory(sessionId, fallback) {
+  const cfg = ctxConfig(sessionId);
+  if (!cfg) return safeHistory(fallback);
+  try {
+    const { response, data } = await fetchJson(cfg.url, { headers: cfg.headers }, CTX_TIMEOUT_MS);
+    if (response.ok) return safeHistory(data?.history);
+  } catch (error) {
+    console.warn("Context store read failed; continuing without history.");
+  }
+  return safeHistory(fallback);
+}
+
+async function saveHistory(sessionId, history) {
+  const cfg = ctxConfig(sessionId);
+  if (!cfg) return;
+  try {
+    await fetchJson(cfg.url, { method: "PUT", headers: cfg.headers, body: JSON.stringify({ history }) }, CTX_TIMEOUT_MS);
+  } catch (error) {
+    console.warn("Context store write failed.");
+  }
+}
+
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
@@ -208,7 +240,10 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const sessionId = body?.session?.session_id;
+  const oldHistory = text
+    ? await loadHistory(sessionId, body?.state?.session?.history)
+    : safeHistory(body?.state?.session?.history);
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -238,6 +273,7 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    await saveHistory(sessionId, history);
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
